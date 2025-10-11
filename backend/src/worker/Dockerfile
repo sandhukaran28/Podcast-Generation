@@ -1,4 +1,4 @@
-﻿# backend/worker/Dockerfile
+# backend/worker/Dockerfile
 FROM node:20-bookworm
 
 # --- Basics ---
@@ -44,5 +44,8 @@ ENV NODE_ENV=production \
     PIPER_VOICE_A=/app/models/en_US-amy-medium.onnx \
     PIPER_VOICE_B=/app/models/en_US-ryan-high.onnx
 
+# --- AWS Credentials volume mount point ---
+VOLUME ["/root/.aws"]
+
 # Worker has no HTTP port to expose; it polls SQS and runs jobs
-CMD ["node", "src/server.js"]
+CMD ["node", "src/worker/worker.js"]

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  noteflix-worker:
+    build:
+      context: .
+      dockerfile: src/worker/Dockerfile
+    image: noteflix-worker:latest
+    volumes:
+      # Mount AWS credentials (Windows path)
+      - ${USERPROFILE}/.aws:/root/.aws:ro
+      # Mount data directory for processing files
+      - ./data:/data
+    environment:
+      - NODE_ENV=production
+      - DATA_ROOT=/data
+      - AWS_REGION=ap-southeast-2
+    restart: unless-stopped
+    container_name: noteflix-worker

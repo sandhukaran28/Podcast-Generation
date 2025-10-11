@@ -6,7 +6,7 @@ const { getItem, sks } = require("../ddb");
 const { processJob } = require("./processor");
 
 const sqs = new SQSClient({ region: process.env.AWS_REGION || "ap-southeast-2" });
-const QUEUE_URL = process.env.SQS_QUEUE_URL;
+const QUEUE_URL = process.env.SQS_QUEUE_URL || "https://sqs.ap-southeast-2.amazonaws.com/901444280953/Noteflix-jobs";
 if (!QUEUE_URL) throw new Error("SQS_QUEUE_URL env required");
 
 const DATA_ROOT = process.env.DATA_ROOT || "./data";

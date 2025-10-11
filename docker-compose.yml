@@ -1,4 +1,4 @@
-version: '3.8'
+
 
 networks:
   noteflix-net:
@@ -61,7 +61,7 @@ services:
   # --- Your API (kept close to your original config) ---
   api:
     # Use ONE of these:
-    image: noteflix-api:v3     # <— if you already built/tagged it locally
+    image: noteflix-api:latest     # <— if you already built/tagged it locally
     # build: ./backend         # <— or build from Dockerfile in ./backend
     container_name: noteflix
     networks: [noteflix-net]
@@ -71,8 +71,8 @@ services:
     expose:
       - "8080"                 # internal only; proxy will route to it
     volumes:
+      - ~/.aws:/root/.aws:ro  
       - noteflix-data:/data
-      - "${USERPROFILE}\\.aws:/root/.aws:ro"
     env_file:
       - ./backend/.env
     environment:
