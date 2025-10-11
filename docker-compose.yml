@@ -1,0 +1,133 @@
+version: '3.8'
+
+networks:
+  noteflix-net:
+    external: true
+
+volumes:
+  noteflix-data:
+    name: noteflix-data
+    external: true
+  ollama:
+    name: ollama
+    external: true
+  redis-data:
+    name: redis-data
+    external: true
+
+services:
+  # --- Reverse proxy (one origin, no CORS) ---
+  proxy:
+    image: nginx:1.27
+    container_name: noteflix-proxy
+    networks: [noteflix-net]
+    ports:
+      - "80:80"            # expose the whole app via port 80
+      # - "443:443"        # enable + add TLS in nginx.conf if needed
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - api
+    restart: unless-stopped
+
+  # --- Next.js frontend ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: noteflix-frontend
+    networks: [noteflix-net]
+    environment:
+      # IMPORTANT: same-origin via proxy path
+      - NEXT_PUBLIC_API_URL=/api
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost/api/v1
+      - NEXT_PUBLIC_COGNITO_DOMAIN=https://ap-southeast-2zcgk0caao.auth.ap-southeast-2.amazoncognito.com
+      - NEXT_PUBLIC_COGNITO_CLIENT_ID=68miclsu9htda62gk523eacf4q
+      - NEXT_PUBLIC_COGNITO_USER_POOL_ID=ap-southeast-2_ZCGK0cAAO
+      - NEXT_PUBLIC_REDIRECT_URI=http://localhost/api/auth/google/callback
+      - NEXT_PUBLIC_LOGOUT_REDIRECT_URI=http://localhost
+      - NEXT_PUBLIC_COGNITO_ADMIN_GROUP=Admin
+      - NEXT_PUBLIC_AWS_REGION=ap-southeast-2
+    expose:
+      - "3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # --- Your API (kept close to your original config) ---
+  api:
+    # Use ONE of these:
+    image: noteflix-api:v3     # <— if you already built/tagged it locally
+    # build: ./backend         # <— or build from Dockerfile in ./backend
+    container_name: noteflix
+    networks: [noteflix-net]
+    depends_on:
+      - ollama
+      - redis
+    expose:
+      - "8080"                 # internal only; proxy will route to it
+    volumes:
+      - noteflix-data:/data
+      - "${USERPROFILE}\\.aws:/root/.aws:ro"
+    env_file:
+      - ./backend/.env
+    environment:
+      - PORT=8080
+      - DATA_ROOT=/data
+      - OLLAMA_BASE=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+      - PIPER_VOICE_A=/app/models/en_US-amy-medium.onnx
+      - PIPER_VOICE_B=/app/models/en_US-ryan-high.onnx
+      - AWS_SDK_LOAD_CONFIG=1                  # read /root/.aws/config & SSO cache
+      - AWS_PROFILE=default                    # use the profile you logged into
+      - AWS_REGION=ap-southeast-2
+      - S3_BUCKET=n11845619-assignment2        # <-- set your bucket
+      - S3_PREFIX=noteflix/outputs
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # --- Ollama (shared across stack) ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    networks: [noteflix-net]
+    # keep port published if you want local host access; otherwise remove
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  # --- Redis Cache ---
+  redis:
+    image: redis:7-alpine
+    container_name: noteflix-redis
+    networks: [noteflix-net]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
