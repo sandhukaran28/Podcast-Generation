@@ -300,6 +300,14 @@ ${excerpt || "(No extracted text available.)"}`.trim();
     const nSlides = Math.max(1, slides.length);
     log("Found " + nSlides + " slides: " + slides.join(", "));
 
+    if (slides.length === 0) {
+      throw new Error("No slide images found for video encoding");
+    }
+
+    // Use the first available slide (actual filename, not assumed)
+    const firstSlide = path.join(jobDir, slides[0]);
+    log("Using first slide: " + firstSlide);
+
     let totalDuration = ctx.duration || 90;
     if (hasAudio) {
       const dur = getAudioDuration(narrationPath);
@@ -311,12 +319,12 @@ ${excerpt || "(No extracted text available.)"}`.trim();
 
     const profile = String(ctx.encodeProfile || "balanced").toLowerCase();
     
-    // Build FFmpeg command
+    // Build FFmpeg command using actual first slide filename
     let cmd;
     if (hasAudio) {
-      cmd = `ffmpeg -y -loop 1 -i "${jobDir}/slide-001.png" -i "${narrationPath}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest -movflags +faststart "${ctx.outputPath}"`;
+      cmd = `ffmpeg -y -loop 1 -i "${firstSlide}" -i "${narrationPath}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest -movflags +faststart "${ctx.outputPath}"`;
     } else {
-      cmd = `ffmpeg -y -loop 1 -i "${jobDir}/slide-001.png" -c:v libx264 -preset fast -crf 23 -t ${totalDuration} -movflags +faststart "${ctx.outputPath}"`;
+      cmd = `ffmpeg -y -loop 1 -i "${firstSlide}" -c:v libx264 -preset fast -crf 23 -t ${totalDuration} -movflags +faststart "${ctx.outputPath}"`;
     }
 
     log("FFmpeg command: " + cmd);

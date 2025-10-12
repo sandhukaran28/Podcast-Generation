@@ -12,14 +12,19 @@ function hasCmd(name) {
   return r.status === 0 && r.stdout.trim().length > 0;
 }
 
-const PIPER_BIN = process.env.PIPER_BIN || "piper";
+let PIPER_BIN = process.env.PIPER_BIN || "piper";
 
 /**
  * scriptLines: array of strings...
  */
 async function synthesizePodcast(scriptLines, outPath, isDuet, voices = {}) {
+  // Try different piper locations
   if (!hasCmd(PIPER_BIN)) {
-    throw new Error(`${PIPER_BIN} not found. Install Piper TTS and/or set PIPER_BIN`);
+    console.log(`${PIPER_BIN} not found, trying /opt/venv/bin/piper`);
+    PIPER_BIN = "/opt/venv/bin/piper";
+    if (!hasCmd(PIPER_BIN)) {
+      throw new Error(`Piper TTS not found. Tried: ${process.env.PIPER_BIN || "piper"} and /opt/venv/bin/piper`);
+    }
   }
   const { voiceA, voiceB } = voices;
   if (!voiceA) throw new Error("voices.voiceA is required (path to .onnx)");
