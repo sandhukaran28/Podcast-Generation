@@ -1,10 +1,12 @@
-// worker/processor.js
+﻿// Full processor with video generation
 "use strict";
 
-// copy over the same imports you used in jobs.js worker section:
+require("dotenv").config();
+
 const fs = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
+const { pipeline } = require("stream/promises");
 const { synthesizePodcast } = require("../utils/tts");
 const { fetchWikiSummary } = require("../utils/wiki");
 const {
@@ -12,32 +14,25 @@ const {
   PutObjectCommand,
   GetObjectCommand,
 } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const {
-  getJSON,
-  setJSON,
-  getVersion,
-  bumpVersion,
-  stableKeyFromObject,
-} = require("../lib/cache");
-const {
-  DDB_PK_NAME,
-  sks,
-  putItem,
-  getItem,
   updateItem,
-  queryByPrefix,
-  qutUsernameFromReqUser,
   putJobEvent,
-  getJobEvents,
+  sks,
 } = require("../ddb");
+const {
+  bumpVersion,
+} = require("../lib/cache");
 
-// … keep all your helper functions from jobs.js (sh, hasCmd, downloadS3ToFile, getAudioDuration, callOllama, makeVttFromScript, cleanForTTS, etc.)
+// AWS setup
+const s3 = new S3Client({ region: process.env.AWS_REGION || "ap-southeast-2" });
+const S3_BUCKET = process.env.S3_BUCKET;
+const S3_PREFIX = (process.env.S3_PREFIX || "noteflix/outputs").replace(/\/+$/, "");
+
 function s3KeyForJob(jobId) {
   return `${S3_PREFIX}/${jobId}/video.mp4`;
 }
 
-// -------------------- shell helpers --------------------
+// Shell helpers
 function sh(cmd, opts = {}) {
   return spawnSync("bash", ["-lc", cmd], { encoding: "utf8", ...opts });
 }
@@ -48,9 +43,7 @@ function hasCmd(name) {
 }
 
 async function downloadS3ToFile(bucket, key, toPath) {
-  const resp = await s3.send(
-    new GetObjectCommand({ Bucket: bucket, Key: key })
-  );
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   await pipeline(resp.Body, fs.createWriteStream(toPath));
 }
 
@@ -58,10 +51,7 @@ function getAudioDuration(file) {
   try {
     const out = spawnSync(
       "bash",
-      [
-        "-lc",
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`,
-      ],
+      ["-lc", `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`],
       { encoding: "utf8" }
     );
     if (out.status === 0) return Math.ceil(parseFloat(out.stdout.trim()));
@@ -122,130 +112,115 @@ function cleanForTTS(text) {
     .replace(/\*\*?\s*\[[^\]]+\]\s*\*?\s*/g, " ")
     .replace(/\[[0-9:\- ]+seconds?\]/gi, " ")
     .replace(/\*\*/g, " ")
-    .replace(/[_`#>•▪︎•·–—“”‘’]/g, " ")
+    .replace(/[_`#>•▪︎•·–—""'']/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
+
 async function processJob(id, asset, ctx) {
-  const log = (s) => fs.appendFileSync(ctx.logsPath, s + "\n");
+  const log = (s) => {
+    const msg = `[${new Date().toISOString()}] ${s}`;
+    console.log(msg);
+    try { 
+      fs.appendFileSync(ctx.logsPath, msg + "\n"); 
+    } catch (e) {}
+  };
+  
+  log("=== STARTING FULL VIDEO PROCESSING ===");
+  log("Job ID: " + id);
+  log("qutUser: " + ctx.qutUser);
+  log("Asset: " + JSON.stringify(asset, null, 2));
+  
   const start = Date.now();
 
-  // mark running
-  await updateItem(
-    ctx.qutUser,
-    sks.job(id),
-    "SET #status = :s, #startedAt = :t",
-    { "#status": "status", "#startedAt": "startedAt" },
-    { ":s": "running", ":t": new Date().toISOString() }
-  );
-  await bumpVersion("jobs", ctx.qutUser);
+  try {
+    // Step 1: Update job status
+    log("Step 1: Updating job status to running...");
+    await updateItem(
+      ctx.qutUser,
+      sks.job(id),
+      "SET #status = :s, #startedAt = :t",
+      { "#status": "status", "#startedAt": "startedAt" },
+      { ":s": "running", ":t": new Date().toISOString() }
+    );
+    await bumpVersion("jobs", ctx.qutUser);
+    putJobEvent(id, ctx.qutUser, "running", "Processing started").catch(() => {});
+    await bumpVersion("audit", ctx.qutUser);
+    log("✓ Job status updated");
 
-  // Audit: running
-  putJobEvent(id, ctx.qutUser, "running", "Processing started").catch(() => {});
-  await bumpVersion("audit", ctx.qutUser);
+    // Step 2: Download and process source file
+    log("Step 2: Processing source file...");
+    const jobDir = ctx.jobDir;
+    fs.mkdirSync(jobDir, { recursive: true });
+    
+    let sourcePath;
+    let isPdf = false;
 
-  (async () => {
-    try {
-      // 1) PDF -> images (or copy single image)
-      // 1) Materialize source file (from S3 or local legacy) → then PDF->images or copy image
-      const jobDir = ctx.jobDir;
-      fs.mkdirSync(jobDir, { recursive: true });
+    if (asset.s3Bucket && asset.s3Key) {
+      log("Downloading from S3: s3://" + asset.s3Bucket + "/" + asset.s3Key);
+      const ext = path.extname(asset.s3Key || "").toLowerCase();
+      isPdf = asset.type === "pdf" || ext === ".pdf";
+      sourcePath = path.join(jobDir, "source" + (ext || (isPdf ? ".pdf" : "")));
+      
+      await downloadS3ToFile(asset.s3Bucket, asset.s3Key, sourcePath);
+      log("✓ S3 download completed: " + sourcePath);
+    } else {
+      throw new Error("No S3 source found in asset");
+    }
 
-      // decide where to read from
-      let sourcePath; // the local, materialized file we will use
-      let isPdf;
-
-      // Prefer S3 pointers (new stateless flow)
-      if (asset.s3Bucket && asset.s3Key) {
-        // infer extension/type
-        const ext = path.extname(asset.s3Key || "").toLowerCase();
-        isPdf = asset.type === "pdf" || ext === ".pdf";
-        sourcePath = path.join(
-          jobDir,
-          "source" + (ext || (isPdf ? ".pdf" : ""))
-        );
-
-        // download to tmp
-        await downloadS3ToFile(asset.s3Bucket, asset.s3Key, sourcePath);
-      } else {
-        // legacy/local path fallback (for old data)
-        if (!asset.path)
-          throw new Error("asset has no s3Key and no local path");
-        sourcePath = asset.path;
-        const ext = path.extname(sourcePath || "").toLowerCase();
-        isPdf = asset.type === "pdf" || ext === ".pdf";
+    // Step 3: Convert PDF to images or copy single image
+    log("Step 3: Converting to images...");
+    if (isPdf) {
+      if (!hasCmd("pdftoppm")) {
+        throw new Error("pdftoppm not found (install poppler-utils)");
       }
-
-      if (isPdf) {
-        if (!hasCmd("pdftoppm"))
-          throw new Error("pdftoppm not found (install poppler-utils)");
-        const p1 = sh(`pdftoppm -png "${sourcePath}" "${jobDir}/slide"`);
-        log(p1.stdout || "");
-        log(p1.stderr || "");
-        if (p1.status !== 0) throw new Error("pdf->images failed");
-      } else {
-        const slide1 = path.join(jobDir, "slide-001.png");
-        // If source is already a PNG/JPG, let ffmpeg read it as PNG—cp is fine
-        const p1 = sh(`cp "${sourcePath}" "${slide1}"`);
-        log(p1.stderr || "");
-        if (p1.status !== 0) throw new Error("copy image failed");
+      const pdfCmd = `pdftoppm -png "${sourcePath}" "${jobDir}/slide"`;
+      log("Running: " + pdfCmd);
+      const p1 = sh(pdfCmd);
+      if (p1.status !== 0) {
+        log("PDF conversion failed: " + p1.stderr);
+        throw new Error("PDF conversion failed");
       }
+      log("✓ PDF converted to images");
+    } else {
+      const slide1 = path.join(jobDir, "slide-001.png");
+      const copyCmd = `cp "${sourcePath}" "${slide1}"`;
+      log("Running: " + copyCmd);
+      const p1 = sh(copyCmd);
+      if (p1.status !== 0) {
+        log("Image copy failed: " + p1.stderr);
+        throw new Error("Image copy failed");
+      }
+      log("✓ Image copied");
+    }
 
-      // visibility for debugging
-      const ls = sh(`ls -l "${jobDir}" | head -n 40`);
-      log(ls.stdout || "");
-      log(ls.stderr || "");
+    // Check what files we created
+    const ls = sh(`ls -la "${jobDir}"`);
+    log("Job directory contents:\n" + (ls.stdout || ""));
 
-      // 2) Extract text + Ollama script (duration-aware)
-      let scriptText = "";
-      if (isPdf) {
-        if (!hasCmd("pdftotext"))
-          log("WARN: pdftotext not found; using fallback summary prompt.");
-        let notes = "";
-        if (hasCmd("pdftotext")) {
-          const textPath = path.join(ctx.jobDir, "notes.txt");
-          const t1 = sh(`pdftotext "${sourcePath}" "${textPath}"`);
-
-          log(t1.stderr || "");
-          if (t1.status === 0 && fs.existsSync(textPath)) {
-            notes = fs.readFileSync(textPath, "utf8");
-          }
+    // Step 4: Generate script with Ollama
+    log("Step 4: Generating script with Ollama...");
+    let scriptText = "";
+    
+    if (isPdf) {
+      let notes = "";
+      if (hasCmd("pdftotext")) {
+        const textPath = path.join(jobDir, "notes.txt");
+        const t1 = sh(`pdftotext "${sourcePath}" "${textPath}"`);
+        if (t1.status === 0 && fs.existsSync(textPath)) {
+          notes = fs.readFileSync(textPath, "utf8");
+          log("Extracted " + notes.length + " characters from PDF");
         }
+      }
 
-        const wpm = 150;
-        const targetSeconds = Math.max(
-          30,
-          Math.min(600, Number(ctx.duration || 90))
-        );
-        const targetWords = Math.round((wpm / 60) * targetSeconds);
+      const wpm = 150;
+      const targetSeconds = Math.max(30, Math.min(600, Number(ctx.duration || 90)));
+      const targetWords = Math.round((wpm / 60) * targetSeconds);
+      const duet = ctx.dialogue === "duet";
+      const excerpt = (notes || "").trim().slice(0, 4000);
 
-        const duet = ctx.dialogue === "duet";
-        const excerpt = (notes || "").trim().slice(0, 4000);
-
-        let wiki = null;
-        try {
-          const orig = (() => {
-            try {
-              const meta = asset.meta || {};
-              return (meta.originalName || "").replace(/\.[^.]+$/, "");
-            } catch {
-              return "";
-            }
-          })();
-          if (excerpt.length < 120 && orig) {
-            wiki = await fetchWikiSummary(orig);
-          }
-        } catch {}
-
-        const prompt = `
-You are scripting a short educational podcast${
-          duet ? " with TWO speakers (Alex and Sam)" : ""
-        }.
-${
-  duet
-    ? "Write alternating lines starting with 'Alex:' and 'Sam:'."
-    : "Write a single narrator script."
-}
+      const prompt = `You are scripting a short educational podcast${duet ? " with TWO speakers (Alex and Sam)" : ""}.
+${duet ? "Write alternating lines starting with 'Alex:' and 'Sam:'." : "Write a single narrator script."}
 
 Constraints:
 - Target length: ~${targetWords} words (≈ ${targetSeconds} seconds at ~${wpm} wpm).
@@ -254,261 +229,202 @@ Constraints:
 - Do NOT include stage directions, timecodes, or markdown—just the spoken lines.
 
 NOTES:
-${excerpt || "(No extracted text available.)"}
+${excerpt || "(No extracted text available.)"}`.trim();
 
-${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
-
-        const base = process.env.OLLAMA_BASE || "http://localhost:11434";
-        const model = process.env.OLLAMA_MODEL || "llama3";
-        log(`Calling Ollama at ${base} with model ${model} ...`);
-        try {
-          // const resp = await callOllama(prompt, { base, model });
-          // scriptText = resp;
-          scriptText =
-            "This video animates your uploaded slide. Add more pages for a richer episode.";
-        } catch (e) {
-          log("Ollama call failed: " + e.message);
-          scriptText =
-            "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
-        }
-      } else {
-        scriptText =
-          "This video animates your uploaded slide. Add more pages for a richer episode.";
-      }
-
-      const scriptPath = path.join(ctx.jobDir, "script.txt");
-      fs.writeFileSync(scriptPath, scriptText, "utf8");
-
-      // 3) TTS
-      log("Cleaning script for TTS...");
-      const cleaned = cleanForTTS(scriptText);
-
-      let scriptLines;
-      if (ctx.dialogue === "duet") {
-        const labeled = cleaned
-          .split(/\r?\n/)
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
-        scriptLines = hasLabels
-          ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""))
-          : cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
-      } else {
-        scriptLines = [cleaned];
-      }
-
-      fs.writeFileSync(
-        path.join(ctx.jobDir, "tts_clean.txt"),
-        scriptLines.join("\n"),
-        "utf8"
-      );
-      log("Starting TTS synthesis (Piper)...");
-      let narrationPath = null;
+      const base = process.env.OLLAMA_BASE || "http://localhost:11434";
+      const model = process.env.OLLAMA_MODEL || "llama3";
+      
+      log("Calling Ollama at " + base + " with model " + model);
       try {
-        narrationPath = path.join(ctx.jobDir, "narration.wav");
-        const voices = {
-          voiceA:
-            process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
-          voiceB:
-            process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
-        };
-        await synthesizePodcast(
-          scriptLines,
-          narrationPath,
-          ctx.dialogue === "duet",
-          voices
-        );
-        log("TTS synthesis complete");
+        const resp = await callOllama(prompt, { base, model });
+        scriptText = resp;
+        log("✓ Ollama response received (" + resp.length + " chars)");
       } catch (e) {
-        log("TTS synthesis failed: " + e.message);
-        narrationPath = null;
+        log("Ollama call failed: " + e.message);
+        scriptText = "Welcome to NoteFlix. This is an automatically generated study summary. Please review your notes and key definitions.";
       }
-      const hasAudio = !!narrationPath && fs.existsSync(narrationPath);
+    } else {
+      scriptText = "This video animates your uploaded slide. Add more pages for a richer episode.";
+    }
 
-      // 4) captions
-      const vtt = makeVttFromScript(scriptText);
-      const vttPath = path.join(ctx.jobDir, "captions.vtt");
-      fs.writeFileSync(vttPath, vtt, "utf8");
+    const scriptPath = path.join(jobDir, "script.txt");
+    fs.writeFileSync(scriptPath, scriptText, "utf8");
+    log("✓ Script saved: " + scriptPath);
 
-      // 5) encoding
-      const slides = fs
-        .readdirSync(ctx.jobDir)
-        .filter((f) => /^slide-.*\.png$/i.test(f))
-        .sort();
-      const nSlides = Math.max(1, slides.length);
+    // Step 5: TTS synthesis
+    log("Step 5: Synthesizing audio...");
+    const cleaned = cleanForTTS(scriptText);
+    let scriptLines;
+    
+    if (ctx.dialogue === "duet") {
+      const labeled = cleaned.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const hasLabels = labeled.some((l) => /^alex:|^sam:/i.test(l));
+      scriptLines = hasLabels
+        ? labeled.map((l) => l.replace(/^(alex|sam):\s*/i, ""))
+        : cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
+    } else {
+      scriptLines = [cleaned];
+    }
 
-      let totalDuration = ctx.duration || 90;
-      if (hasAudio) {
-        const dur = getAudioDuration(narrationPath);
-        if (dur && dur > 0) {
-          totalDuration = dur;
-          log(`Detected narration length: ${dur}s`);
-        }
+    let narrationPath = null;
+    let hasAudio = false;
+    
+    try {
+      narrationPath = path.join(jobDir, "narration.wav");
+      const voices = {
+        voiceA: process.env.PIPER_VOICE_A || "/app/models/en_US-amy-medium.onnx",
+        voiceB: process.env.PIPER_VOICE_B || "/app/models/en_US-ryan-high.onnx",
+      };
+      
+      await synthesizePodcast(scriptLines, narrationPath, ctx.dialogue === "duet", voices);
+      hasAudio = fs.existsSync(narrationPath);
+      log("✓ TTS synthesis complete, audio: " + hasAudio);
+    } catch (e) {
+      log("TTS synthesis failed: " + e.message);
+      hasAudio = false;
+    }
+
+    // Step 6: Create captions
+    log("Step 6: Creating captions...");
+    const vtt = makeVttFromScript(scriptText);
+    const vttPath = path.join(jobDir, "captions.vtt");
+    fs.writeFileSync(vttPath, vtt, "utf8");
+    log("✓ Captions created");
+
+    // Step 7: Video encoding
+    log("Step 7: Encoding video...");
+    const slides = fs.readdirSync(jobDir)
+      .filter((f) => /^slide-.*\.png$/i.test(f))
+      .sort();
+    
+    const nSlides = Math.max(1, slides.length);
+    log("Found " + nSlides + " slides: " + slides.join(", "));
+
+    let totalDuration = ctx.duration || 90;
+    if (hasAudio) {
+      const dur = getAudioDuration(narrationPath);
+      if (dur && dur > 0) {
+        totalDuration = dur;
+        log("Using audio duration: " + dur + "s");
       }
+    }
 
-      const profile = String(ctx.encodeProfile || "balanced").toLowerCase();
-      const perSlideSec = Math.max(4, Math.round(totalDuration / nSlides));
-      const baseFps = profile === "insane" ? 60 : profile === "heavy" ? 48 : 30;
-      const dFrames = perSlideSec * baseFps;
-      const fr = 1 / perSlideSec;
+    const profile = String(ctx.encodeProfile || "balanced").toLowerCase();
+    
+    // Build FFmpeg command
+    let cmd;
+    if (hasAudio) {
+      cmd = `ffmpeg -y -loop 1 -i "${jobDir}/slide-001.png" -i "${narrationPath}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -shortest -movflags +faststart "${ctx.outputPath}"`;
+    } else {
+      cmd = `ffmpeg -y -loop 1 -i "${jobDir}/slide-001.png" -c:v libx264 -preset fast -crf 23 -t ${totalDuration} -movflags +faststart "${ctx.outputPath}"`;
+    }
 
-      const outW =
-        profile === "insane" ? 3840 : profile === "heavy" ? 2560 : 1920;
-      const outH =
-        profile === "insane" ? 2160 : profile === "heavy" ? 1440 : 1080;
+    log("FFmpeg command: " + cmd);
+    
+    const enc = spawn("bash", ["-lc", cmd]);
+    enc.stdout.on("data", (d) => log("FFMPEG: " + d.toString().trim()));
+    enc.stderr.on("data", (d) => log("FFMPEG: " + d.toString().trim()));
+    
+    await new Promise((resolve, reject) => {
+      enc.on("close", (code) => {
+        log("FFmpeg finished with code: " + code);
+        if (code === 0) resolve();
+        else reject(new Error("FFmpeg failed with code: " + code));
+      });
+    });
 
-      const zoom = `zoompan=z='zoom+0.001':d=${dFrames}:s=${outW}x${outH}`;
-      const baseFilters = [
-        zoom,
-        `scale=${outW}:${outH}:flags=lanczos`,
-        `unsharp=5:5:0.5:5:5:0.5`,
-        `eq=contrast=1.05:brightness=0.02:saturation=1.05`,
-        `vignette=PI/6`,
-      ];
-      if (profile !== "balanced") {
-        baseFilters.push(
-          `minterpolate='mi_mode=mci:mc_mode=aobmc:vsbmc=1:fps=${baseFps}'`
+    if (!fs.existsSync(ctx.outputPath)) {
+      throw new Error("FFmpeg failed to produce output file");
+    }
+    
+    const outputSize = fs.statSync(ctx.outputPath).size;
+    log("✓ Video created: " + outputSize + " bytes");
+
+    // Step 8: Create metrics
+    try {
+      const metrics = {
+        durationSeconds: totalDuration,
+        slides: nSlides,
+        profile,
+        hasAudio: !!hasAudio,
+        audioSeconds: hasAudio ? getAudioDuration(narrationPath) : 0,
+        cpuSeconds: Math.round((Date.now() - start) / 1000),
+        outputBytes: outputSize,
+      };
+      fs.writeFileSync(path.join(jobDir, "metrics.json"), JSON.stringify(metrics, null, 2));
+      log("✓ Metrics saved");
+    } catch (e) {
+      log("WARN: failed to write metrics: " + e.message);
+    }
+
+    // Step 9: Upload to S3 (if configured)
+    let uploaded = false;
+    if (S3_BUCKET) {
+      try {
+        const s3Key = s3KeyForJob(id);
+        log("Uploading to S3: s3://" + S3_BUCKET + "/" + s3Key);
+        
+        await s3.send(new PutObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: s3Key,
+          Body: fs.createReadStream(ctx.outputPath),
+          ContentType: "video/mp4",
+          ContentDisposition: 'attachment; filename="video.mp4"',
+        }));
+        
+        uploaded = true;
+        
+        await updateItem(
+          ctx.qutUser,
+          sks.job(id),
+          "SET #s3Bucket = :b, #s3Key = :k",
+          { "#s3Bucket": "s3Bucket", "#s3Key": "s3Key" },
+          { ":b": S3_BUCKET, ":k": s3Key }
         );
+        
+        log("✓ S3 upload complete");
+      } catch (e) {
+        log("WARN: S3 upload failed: " + e.message);
       }
-      baseFilters.push(`format=yuv420p`);
-      const vf = baseFilters.join(",");
-      const af = hasAudio
-        ? `-ar 48000 -af "loudnorm=I=-16:LRA=11:TP=-1.5"`
-        : "";
+    }
 
-      const preset =
-        profile === "insane"
-          ? "veryslow"
-          : profile === "heavy"
-          ? "slower"
-          : "slow";
-      const crf = profile === "insane" ? 16 : profile === "heavy" ? 18 : 20;
-
-      if (profile !== "balanced") {
-        const passlog = path.join(ctx.jobDir, "ffpass");
-        const cmd1 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -an -pass 1 -passlogfile "${passlog}" -f mp4 /dev/null`;
-        log("ENC PASS1: " + cmd1);
-        const enc1 = spawn("bash", ["-lc", cmd1]);
-        enc1.stdout.on("data", (d) => log(d.toString()));
-        enc1.stderr.on("data", (d) => log(d.toString()));
-        await new Promise((resolve) => enc1.on("close", resolve));
-
-        const cmd2 = `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${
-          ctx.jobDir
-        }/slide-*.png" ${
-          hasAudio ? `-i "${narrationPath}"` : ""
-        } -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${
-          hasAudio ? `${af} -c:a aac -b:a 192k` : ""
-        } -movflags +faststart -shortest -pass 2 -passlogfile "${passlog}" "${
-          ctx.outputPath
-        }"`;
-        log("ENC PASS2: " + cmd2);
-        const enc2 = spawn("bash", ["-lc", cmd2]);
-        enc2.stdout.on("data", (d) => log(d.toString()));
-        enc2.stderr.on("data", (d) => log(d.toString()));
-        await new Promise((resolve) => enc2.on("close", resolve));
-      } else {
-        const cmd = hasAudio
-          ? `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -i "${narrationPath}" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p ${af} -c:a aac -b:a 192k -movflags +faststart -shortest "${ctx.outputPath}"`
-          : `ffmpeg -y -threads 0 -framerate ${fr} -pattern_type glob -i "${ctx.jobDir}/slide-*.png" -filter_complex "${vf}" -c:v libx264 -preset ${preset} -crf ${crf} -pix_fmt yuv420p -movflags +faststart "${ctx.outputPath}"`;
-        log("ENC: " + cmd);
-        const enc = spawn("bash", ["-lc", cmd]);
-        enc.stdout.on("data", (d) => log(d.toString()));
-        enc.stderr.on("data", (d) => log(d.toString()));
-        await new Promise((resolve) => enc.on("close", resolve));
+    // Step 10: Finalize job
+    log("Step 10: Finalizing job...");
+    const cpuSeconds = Math.round((Date.now() - start) / 1000);
+    
+    await updateItem(
+      ctx.qutUser,
+      sks.job(id),
+      "SET #status=:st, #finishedAt=:fin, #cpuSeconds=:cpu, #outputPath=:out",
+      {
+        "#status": "status",
+        "#finishedAt": "finishedAt",
+        "#cpuSeconds": "cpuSeconds",
+        "#outputPath": "outputPath",
+      },
+      {
+        ":st": "done",
+        ":fin": new Date().toISOString(),
+        ":cpu": cpuSeconds,
+        ":out": ctx.outputPath,
       }
+    );
+    
+    await bumpVersion("jobs", ctx.qutUser);
+    putJobEvent(id, ctx.qutUser, "done", uploaded ? "Complete (uploaded to S3)" : "Complete").catch(() => {});
+    await bumpVersion("audit", ctx.qutUser);
 
+    log("=== JOB COMPLETED SUCCESSFULLY ===");
+    log("Total time: " + cpuSeconds + "s, uploaded: " + uploaded);
+    
+  } catch (err) {
+    const msg = err?.message || String(err);
+    log("=== JOB FAILED ===");
+    log("Error: " + msg);
+    log("Stack: " + (err?.stack || "No stack"));
+    
+    try {
       const cpuSeconds = Math.round((Date.now() - start) / 1000);
-      if (!fs.existsSync(ctx.outputPath))
-        throw new Error("ffmpeg failed to produce output");
-
-      try {
-        const outputStat = fs.statSync(ctx.outputPath);
-        const metrics = {
-          durationSeconds: totalDuration,
-          slides: nSlides,
-          fpsTarget: baseFps,
-          resolution: { width: outW, height: outH },
-          profile,
-          hasAudio: !!hasAudio,
-          audioSeconds: hasAudio ? getAudioDuration(narrationPath) : 0,
-          cpuSeconds,
-          outputBytes: outputStat?.size || 0,
-        };
-        fs.writeFileSync(
-          path.join(ctx.jobDir, "metrics.json"),
-          JSON.stringify(metrics, null, 2)
-        );
-      } catch (e) {
-        log("WARN: failed to write metrics.json: " + e.message);
-      }
-
-      // Upload to S3 (if configured)
-      let uploaded = false;
-      let s3Key = null;
-      if (S3_BUCKET) {
-        try {
-          s3Key = s3KeyForJob(id);
-          log(`Uploading output to s3://${S3_BUCKET}/${s3Key} ...`);
-          await s3.send(
-            new PutObjectCommand({
-              Bucket: S3_BUCKET,
-              Key: s3Key,
-              Body: fs.createReadStream(ctx.outputPath),
-              ContentType: "video/mp4",
-              ContentDisposition: 'attachment; filename="video.mp4"',
-            })
-          );
-          uploaded = true;
-          await updateItem(
-            ctx.qutUser,
-            sks.job(id),
-            "SET #s3Bucket = :b, #s3Key = :k",
-            { "#s3Bucket": "s3Bucket", "#s3Key": "s3Key" },
-            { ":b": S3_BUCKET, ":k": s3Key }
-          );
-          log("S3 upload complete");
-        } catch (e) {
-          log("WARN: S3 upload failed: " + (e.message || String(e)));
-        }
-      }
-
-      // Finalize
-      await updateItem(
-        ctx.qutUser,
-        sks.job(id),
-        "SET #status=:st, #finishedAt=:fin, #cpuSeconds=:cpu, #outputPath=:out",
-        {
-          "#status": "status",
-          "#finishedAt": "finishedAt",
-          "#cpuSeconds": "cpuSeconds",
-          "#outputPath": "outputPath",
-        },
-        {
-          ":st": "done",
-          ":fin": new Date().toISOString(),
-          ":cpu": Math.round((Date.now() - start) / 1000),
-          ":out": ctx.outputPath,
-        }
-      );
-      await bumpVersion("jobs", ctx.qutUser);
-
-      // Audit: done
-      putJobEvent(
-        id,
-        ctx.qutUser,
-        "done",
-        uploaded ? "Encoding complete (uploaded to S3)" : "Encoding complete"
-      ).catch(() => {});
-      await bumpVersion("audit", ctx.qutUser);
-
-      log("JOB DONE" + (uploaded ? " (and uploaded to S3)" : ""));
-    } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
       await updateItem(
         ctx.qutUser,
         sks.job(id),
@@ -521,14 +437,21 @@ ${wiki ? `WIKI:\n${wiki}\n` : ""}`.trim();
         {
           ":st": "failed",
           ":fin": new Date().toISOString(),
-          ":cpu": Math.round((Date.now() - start) / 1000),
+          ":cpu": cpuSeconds,
         }
       );
+      
       await bumpVersion("jobs", ctx.qutUser);
       putJobEvent(id, ctx.qutUser, "failed", msg).catch(() => {});
       await bumpVersion("audit", ctx.qutUser);
-      log("FAILED: " + msg);
+      
+      log("✓ Job status updated to failed");
+    } catch (updateErr) {
+      log("ERROR updating failed status: " + updateErr.message);
     }
-  })();
+    
+    throw err;
+  }
 }
+
 module.exports = { processJob };

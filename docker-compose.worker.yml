@@ -8,7 +8,7 @@ services:
     image: noteflix-worker:latest
     volumes:
       # Mount AWS credentials (Windows path)
-      - ${USERPROFILE}/.aws:/root/.aws:ro
+      - ~/.aws:/root/.aws:ro
       # Mount data directory for processing files
       - ./data:/data
     environment:
